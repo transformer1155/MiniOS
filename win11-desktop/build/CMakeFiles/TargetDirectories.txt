@@ -1,0 +1,3 @@
+/mnt/d/MyOS/win11-desktop/build/CMakeFiles/win11desktop.dir
+/mnt/d/MyOS/win11-desktop/build/CMakeFiles/edit_cache.dir
+/mnt/d/MyOS/win11-desktop/build/CMakeFiles/rebuild_cache.dir

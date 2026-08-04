@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/win11desktop.dir/link.d CMakeFiles/win11desktop.dir/src/apps.cpp.o CMakeFiles/win11desktop.dir/src/gfx.cpp.o CMakeFiles/win11desktop.dir/src/main.cpp.o CMakeFiles/win11desktop.dir/src/shell.cpp.o CMakeFiles/win11desktop.dir/src/window.cpp.o -o win11desktop  /usr/lib/x86_64-linux-gnu/libSDL2.so
