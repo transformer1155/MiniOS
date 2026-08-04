@@ -52,6 +52,7 @@ def gb_code(ch):
 def render_glyph(ch, font):
     """Render char into 16x16 bitmap by drawing at 22px then downscaling.
     Direct 16px in SimSun yields nearly-empty glyphs.
+    Lower threshold = more pixels kept = bolder strokes.
     """
     from PIL import Image, ImageDraw
     src = Image.new('L', (22, 22), 0)
@@ -64,7 +65,7 @@ def render_glyph(ch, font):
             byte = 0
             for b in range(8):
                 col = half * 8 + b
-                if img.getpixel((col, row)) > 128:
+                if img.getpixel((col, row)) > 64:    # lower threshold = bolder
                     byte |= 0x80 >> b
             glyph[row * 2 + half] = byte
     return bytes(glyph)

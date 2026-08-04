@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include "zfont_data.h"   // embedded GB2312 16x16 CJK font (387 glyphs)
+#include "ime_dict.h"     // pinyin -> Hanzi dictionary for IME
 
 // ---- VBE info structure (at physical address 0x5000, set by stage2/UEFI) ----
 // Extended for real-hardware UEFI GOP support
@@ -104,6 +105,69 @@ static bool bga_detect(void) {
 }
 
 static bool g_bga_available = false;  // true if Bochs VBE ports detected
+
+// =====================================================================
+//  Pinyin IME (中文输入法)
+//  Global state bound to the active Terminal window. Typing a-z composes
+//  pinyin; digits pick a candidate; space picks #1; ESC cancels.
+// =====================================================================
+static char   g_ime_py[16];         // composing pinyin
+static int    g_ime_len = 0;
+static bool   g_ime_active = false;
+static int    g_ime_cands[9];       // candidate unicode codepoints
+static int    g_ime_cand_count = 0;
+
+static void ime_reset(){
+    g_ime_len = 0;
+    g_ime_active = false;
+    g_ime_cand_count = 0;
+    g_ime_py[0] = 0;
+}
+
+// Prefix match against the sorted pinyin dictionary.
+static void ime_lookup(){
+    g_ime_cand_count = 0;
+    if (g_ime_len == 0) return;
+    for (int i = 0; i < ime_count && g_ime_cand_count < 9; i++) {
+        // prefix match: ime_pinyin[i] starts with g_ime_py
+        const char* a = ime_pinyin[i];
+        const char* b = g_ime_py;
+        int n = g_ime_len;
+        bool match = true;
+        while (n > 0 && *a) { if (*a != *b) { match = false; break; } a++; b++; n--; }
+        if (match && n == 0)
+            g_ime_cands[g_ime_cand_count++] = ime_unicode[i];
+    }
+}
+
+// Encode a Unicode codepoint as UTF-8 (up to 3 bytes).
+static void utf8_encode(uint32_t cp, char out[4]) {
+    if (cp < 0x80) {
+        out[0] = (char)cp; out[1] = 0;
+    } else if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        out[2] = 0;
+    } else {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        out[3] = 0;
+    }
+}
+
+// Display width in pixels of a mixed UTF-8 string (ASCII 8px, CJK 16px).
+static int utf8_display_width(const char* s) {
+    int w = 0;
+    while (*s) {
+        unsigned char c = (unsigned char)*s;
+        if (c < 0x80) { w += 8; s++; }
+        else if ((c & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) { w += 16; s += 3; }
+        else if ((c & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) { w += 8; s += 2; }
+        else s++;
+    }
+    return w;
+}
 static bool g_vbe_mode_set_by_bios = false;  // true if mode set by BIOS/UEFI
 
 // ---- Serial debug ----
@@ -130,6 +194,10 @@ static int strlen_(const char* s) {
 static int strcmp_(const char* a, const char* b) {
     while (*a && *a == *b) { a++; b++; }
     return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+static int strncmp_(const char* a, const char* b, int n) {
+    while (n > 0 && *a && *a == *b) { a++; b++; n--; }
+    return n == 0 ? 0 : (int)(unsigned char)*a - (int)(unsigned char)*b;
 }
 static void strcpy_(char* d, const char* s) {
     while ((*d++ = *s++));
@@ -1422,11 +1490,10 @@ struct Win11Desktop {
         gfx.draw_text_transparent(sx + 28, sy + (search_h - FONT_H)/2,
                                   "Search MiniOS...", C_WIN_TEXT_SEC);
 
-        // MiniOS logo text above search (with Chinese welcome)
+        // MiniOS logo text above search
         const char* logo = "MiniOS";
         int logo_w = strlen_(logo) * FONT_W * 2; // larger spacing
         gfx.draw_text_transparent(dx + (dw - logo_w)/2, sy - 28, logo, C_ACCENT);
-        gfx.draw_text_utf8_transparent(dx + (dw - 144)/2, sy - 12, "欢迎使用迷你操作系统", C_WIN_TEXT_SEC);
 
         // ---- Quick access shortcuts grid ----
         int grid_y = sy + search_h + 24;
@@ -1594,8 +1661,8 @@ struct Win11Desktop {
 
         // Right side: system tray + clock
         int rx = gfx.width - 8;
-        // Chinese welcome label (CJK test)
-        gfx.draw_text_utf8(rx - 160, 8, "欢迎", C_TOPBAR_TEXT, C_TOPBAR_BG);
+        // Chinese welcome label (CJK test - top right)
+        gfx.draw_text_utf8(rx - 96, 8, "欢迎使用", C_TOPBAR_TEXT, C_TOPBAR_BG);
         // Clock (HH:MM)
         char clock_str[8];
         clock_str[0] = '0' + (clock_h / 10);
@@ -2781,28 +2848,45 @@ struct Win11Desktop {
         // Terminal background (black)
         gfx.fill_rect(win.x + 1, win.content_y(), win.w - 2, win.content_h(), 0x0C0C0C);
 
-        // Terminal output
+        // Terminal output (UTF-8 aware)
         char* p = win.term_buf;
         int ty = y;
         int max_lines = h / 16;
         int line = 0;
         while (*p && line < max_lines) {
-            char t[81];
+            char t[160];
             int ti = 0;
-            while (*p && *p != '\n' && ti < 80) t[ti++] = *p++;
+            while (*p && *p != '\n' && ti < 159) t[ti++] = *p++;
             t[ti] = 0;
             if (*p == '\n') p++;
-            gfx.draw_text_transparent(x, ty, t, 0xCCCCCC);
+            gfx.draw_text_utf8_transparent(x, ty, t, 0xCCCCCC);
             ty += 16;
             line++;
         }
 
         // Input line
         gfx.draw_text_transparent(x, ty, "> ", 0x00FF66);
-        gfx.draw_text_transparent(x + 16, ty, win.term_input, 0xCCCCCC);
-        // Cursor
-        int cx = x + 16 + win.term_input_len * FONT_W;
+        gfx.draw_text_utf8_transparent(x + 16, ty, win.term_input, 0xCCCCCC);
+        // Cursor (account for CJK width)
+        int cw = utf8_display_width(win.term_input);
+        int cx = x + 16 + cw;
         gfx.fill_rect(cx, ty, 8, 16, 0xCCCCCC);
+
+        // ---- IME candidate bar (drawn just above the input line, inside window) ----
+        if (g_ime_active && g_ime_cand_count > 0) {
+            int cy = ty - 20;     // ty = input-line y; place bar above it
+            gfx.fill_rect(x, cy, w - 2, 24, 0x1E1E1E);
+            // [pinyin]
+            gfx.draw_text_transparent(x + 4, cy + 4, "[", 0x8888FF);
+            gfx.draw_text_transparent(x + 12, cy + 4, g_ime_py, 0x8888FF);
+            int ccx = x + 12 + g_ime_len * 8 + 14;
+            for (int i = 0; i < g_ime_cand_count; i++) {
+                char num[2]; num[0] = '1' + i; num[1] = 0;
+                gfx.draw_text_transparent(ccx, cy + 4, num, 0xFFCC00);
+                gfx.draw_cjk_transparent(ccx + 10, cy + 3, (uint32_t)g_ime_cands[i], 0xFFFFFF);
+                ccx += 34;
+            }
+        }
     }
 
     // ---- About ----
@@ -3133,7 +3217,10 @@ struct Win11Desktop {
         gui_mode = true;
         cursor.visible = true;       // Make cursor visible on entry
         cursor.saved_valid = false;  // Force background re-capture
+        ime_reset();
         render_all();   // draws everything + cursor + presents to screen
+        // Auto-open a Terminal for immediate IME testing
+        if (window_count == 0) launch_app(APP_TERMINAL);
         serial_puts("[GUI] Entered GUI mode\n");
     }
 
@@ -3666,7 +3753,12 @@ struct Win11Desktop {
 
     bool handle_key(char ch) {
         if (!gui_mode) return false;
-        if (ch == 27) { // ESC
+        if (ch == 27) { // ESC: cancel IME first, else exit GUI
+            if (g_ime_active) {
+                ime_reset();
+                render_all();
+                return true;
+            }
             gui_mode = false;
             cursor.hide(gfx);
             serial_puts("[GUI] Exited GUI mode\n");
@@ -3676,6 +3768,9 @@ struct Win11Desktop {
         if (active_window >= 0 && windows[active_window].app == APP_TERMINAL) {
             Win11Window& win = windows[active_window];
             if (ch == '\n' || ch == 0x0D) { // Enter
+                if (g_ime_active) {          // commit pinyin as ASCII, keep IME on next line
+                    ime_reset();
+                }
                 if (win.term_input_len > 0) {
                     // Add command to output
                     win.term_buf[win.term_len++] = '>';
@@ -3712,11 +3807,51 @@ struct Win11Desktop {
                 render_all();
                 return true;
             } else if (ch == 0x08) { // Backspace
+                if (g_ime_active && g_ime_len > 0) {
+                    g_ime_len--;
+                    g_ime_py[g_ime_len] = 0;
+                    ime_lookup();
+                    render_all();
+                    return true;
+                }
                 if (win.term_input_len > 0) {
                     win.term_input_len--;
                     win.term_input[win.term_input_len] = 0;
                     render_all();
                 }
+                return true;
+            } else if (ch >= '1' && ch <= '9' && g_ime_active && g_ime_cand_count > 0) {
+                // Pick candidate digit
+                int idx = ch - '1';
+                if (idx < g_ime_cand_count) {
+                    char u8[4];
+                    utf8_encode((uint32_t)g_ime_cands[idx], u8);
+                    for (int i = 0; u8[i] && win.term_input_len < 126; i++)
+                        win.term_input[win.term_input_len++] = u8[i];
+                    win.term_input[win.term_input_len] = 0;
+                }
+                ime_reset();
+                render_all();
+                return true;
+            } else if (ch == ' ' && g_ime_active && g_ime_cand_count > 0) {
+                // Space picks candidate #1
+                char u8[4];
+                utf8_encode((uint32_t)g_ime_cands[0], u8);
+                for (int i = 0; u8[i] && win.term_input_len < 126; i++)
+                    win.term_input[win.term_input_len++] = u8[i];
+                win.term_input[win.term_input_len] = 0;
+                ime_reset();
+                render_all();
+                return true;
+            } else if (ch >= 'a' && ch <= 'z' && win.term_input_len < 126) {
+                // Compose pinyin (IME)
+                if (g_ime_len < 15) {
+                    g_ime_py[g_ime_len++] = ch;
+                    g_ime_py[g_ime_len] = 0;
+                    g_ime_active = true;
+                    ime_lookup();
+                }
+                render_all();
                 return true;
             } else if (ch >= 32 && ch < 127 && win.term_input_len < 126) {
                 win.term_input[win.term_input_len++] = ch;
